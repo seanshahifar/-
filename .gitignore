@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+
+# Secrets — never commit API keys
+.env
+
+# Local data, trained models, trade journal
+data/
+models/
+*.db
+*.db-wal
+*.db-shm

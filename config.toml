@@ -1,0 +1,80 @@
+# btcagent configuration. Secrets (API keys) go in .env, never in this file.
+# Any value can also be overridden from the command line:
+#   btcagent run --set trading.fee_rate=0.001 --set risk.max_position_usd=250
+
+[exchange]
+id = "coinbase"            # any ccxt exchange id: coinbase, kraken, binance, binanceus, bitstamp, gemini, ...
+symbol = "BTC/USD"         # use "BTC/USDT" on exchanges that quote in USDT
+sandbox = false            # use the exchange's test environment, if it has one
+use_websocket = true       # stream prices; falls back to REST polling automatically
+poll_interval_seconds = 2.0
+
+[trading]
+mode = "paper"             # "paper" = simulated money on live prices. "live" = real orders (see README)
+# Money the agent manages. Paper: the simulated starting balance. Live: a hard budget —
+# the agent never deploys more than this, and never touches coins it did not buy itself.
+capital_usd = 10000.0
+# Fee per trade as a fraction. SET THIS TO YOUR ACTUAL TIER. It decides whether
+# short-term trading can ever be profitable: every round trip pays it twice.
+# Typical entry-level taker fees: Coinbase Advanced ~0.60%, Kraken Pro ~0.40%, Binance ~0.10%.
+fee_rate = 0.006
+slippage_bps = 2.0         # assumed price slippage per trade, in basis points (1 bp = 0.01%)
+
+[model]
+path = "models/btc_model.joblib"
+timeframe = "1m"           # bar size the model is trained on: 1m, 5m, 15m, 30m, 1h
+horizon_bars = 15          # the model predicts the direction of the next N bars (15 x 1m = 15 minutes)
+training_days = 60         # history used by `btcagent train`
+retrain_every_hours = 0    # >0 retrains in the background and swaps in the new model only if it validates
+
+[strategy]
+decision_interval_seconds = 5   # how often the agent re-evaluates (it can act every few seconds)
+model_weight = 0.75             # blend of the price model and the news signal
+news_weight = 0.25
+entry_threshold = 0.10          # combined signal (-1..+1) needed to buy
+exit_threshold = -0.05          # combined signal at or below which an open position is sold
+min_edge_multiple = 1.25        # only trade if the expected move is >= this x the round-trip cost (fees + slippage + spread)
+require_model = true            # never buy on news alone
+
+[risk]
+max_position_usd = 1000.0       # hard cap on the size of any position
+max_position_pct = 0.5          # ... and never more than this fraction of equity
+min_order_usd = 10.0
+stop_loss_pct = 0.01            # sell if price falls 1% below entry (mandatory)
+take_profit_pct = 0.02          # sell if price rises 2% above entry (0 disables)
+trailing_stop_pct = 0.0         # sell if price falls this far below its peak since entry (0 disables)
+max_hold_minutes = 240          # close positions older than this (0 disables)
+max_daily_loss_pct = 0.03       # stop trading for the rest of the UTC day after losing 3% of equity
+max_drawdown_pct = 0.10         # kill switch: flatten and halt (manual reset needed) after a 10% drop from peak
+max_trades_per_hour = 12
+min_seconds_between_trades = 30
+max_data_age_seconds = 15       # never trade on a stale price
+max_spread_bps = 20             # never buy when the bid/ask spread is wider than this
+news_shock_threshold = -0.5     # if the news signal drops to this, sell and pause buying
+news_shock_pause_minutes = 30
+
+[news]
+enabled = true
+poll_seconds = 60
+half_life_minutes = 90          # a story's influence halves every 90 minutes
+max_age_hours = 12
+claude = "auto"                 # "auto" = use Claude when ANTHROPIC_API_KEY is set, "on", or "off" (lexicon only)
+claude_model = "claude-opus-5-5"
+claude_effort = "low"           # headline scoring is a classification task; low effort keeps it fast
+claude_batch_size = 12
+feeds = [
+  "https://www.coindesk.com/arc/outboundfeeds/rss/",
+  "https://cointelegraph.com/rss",
+  "https://decrypt.co/feed",
+  "https://bitcoinmagazine.com/.rss/full/",
+  "https://news.google.com/rss/search?q=bitcoin+OR+BTC&hl=en-US&gl=US&ceid=US:en",
+]
+
+[dashboard]
+enabled = true
+host = "127.0.0.1"              # binding anything else requires DASHBOARD_TOKEN in .env
+port = 8000
+
+[storage]
+data_dir = "data"
+journal_path = "data/journal.db"
