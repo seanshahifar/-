@@ -72,8 +72,11 @@ To open the dashboard from your phone, run the agent on an always-on host. This 
 
 **Steps**
 
-1. Create a Render account and connect your GitHub account.
-2. In Render choose **New → Blueprint**, then pick this repository (and allow Render to read it if asked). Render reads `render.yaml`, shows the web service and disk it will create, and asks you to confirm. Click **Apply**.
+1. Click the button below. It opens Render with this repository ready to deploy. (Or, inside Render, choose **New → Blueprint** and pick the repository yourself.) Create a Render account if you don't have one, and connect GitHub when asked.
+
+   [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/seanshahifar/-)
+
+2. Render reads `render.yaml`, shows the web service and disk it will create, and asks you to confirm (the button reads **Deploy Blueprint** or **Apply**). Confirm it.
 3. Wait for the first build (a few minutes). When it finishes, Render shows your address, like `https://btcagent-xxxx.onrender.com`.
 4. Open the service's **Environment** tab, find `DASHBOARD_TOKEN` (Render generated a long random value) and copy it. It is your dashboard password.
 5. Open your address and paste the token when asked. That browser remembers it, so you only do this once per device. Bookmark the address.

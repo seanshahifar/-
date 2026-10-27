@@ -336,7 +336,10 @@ const $ = (id) => document.getElementById(id);
 // ---------------------------------------------------------------- access token (hosted dashboards)
 const TOKEN_KEY = "btcagent-token";
 let token = "";
-const tokenFromUrl = new URLSearchParams(location.search).get("token");
+// Read ?token= without URLSearchParams, which turns a raw "+" (common in generated tokens) into a space.
+const rawUrlToken = (location.search.match(/[?&]token=([^&#]*)/) || [])[1];
+let tokenFromUrl = rawUrlToken || null;
+if (tokenFromUrl) { try { tokenFromUrl = decodeURIComponent(tokenFromUrl); } catch { /* keep the raw text */ } }
 if (tokenFromUrl) {  // a link with ?token=... works once: the token stays on this device and leaves the address bar
   token = tokenFromUrl;
   try { localStorage.setItem(TOKEN_KEY, tokenFromUrl); } catch { /* storage unavailable: memory only */ }
