@@ -105,7 +105,7 @@ To open the dashboard from your phone, run the agent on an always-on host. This 
 | What you see | Likely cause |
 |---|---|
 | Asks for the token again and again | The token in Render's **Environment** tab differs from what you typed. Copy it again. |
-| "Can't get prices from …" | The exchange blocks the host's region. Choose another with `BTCAGENT_SET=exchange.id=kraken` (or change Render's region). |
+| "Can't get prices from …" | The exchange blocks the host's region. Switch with `BTCAGENT_SET=exchange.id=bitstamp trading.fee_rate=0.004` (use that exchange's real fee), or change Render's region. Don't pick Kraken: it only serves about 720 bars of history, too few to train on. |
 | Model card says training failed | The reason is shown there. The agent retries every 15 minutes. |
 | The build or start fails | Open the service's **Logs** tab. A missing or short token shows a clear message. |
 
@@ -217,7 +217,7 @@ WantedBy=multi-user.target
 
 To view the dashboard remotely, prefer an SSH tunnel (`ssh -L 8000:localhost:8000 server`). If you bind it to a public address instead (`--host 0.0.0.0`), `DASHBOARD_TOKEN` (at least 16 characters) is mandatory, the page asks for it on the first visit, and you should put HTTPS in front of it. To go live on a hosted agent, set `BTCAGENT_SET=trading.mode=live` together with the exchange keys and `BTCAGENT_LIVE_CONFIRM` as environment variables, and keep the persistent disk: the agent's books must survive restarts.
 
-**Exchanges:** any [ccxt](https://github.com/ccxt/ccxt) exchange id works (`coinbase`, `kraken`, `binance`, `binanceus`, `bitstamp`, `gemini`, …). Use `BTC/USDT` where the exchange quotes in USDT. Kraken's OHLC endpoint only serves the most recent 720 bars, so for training data use `btcagent download --exchange coinbase` (or bitstamp) and keep trading on Kraken.
+**Exchanges:** any [ccxt](https://github.com/ccxt/ccxt) exchange id works (`coinbase`, `kraken`, `binance`, `binanceus`, `bitstamp`, `gemini`, …). Use `BTC/USDT` where the exchange quotes in USDT. Kraken's OHLC endpoint only serves the most recent 720 bars, so for training data use `btcagent download --exchange coinbase` (or bitstamp) and keep trading on Kraken. A hosted agent trains from its own trading exchange's history, so there it needs an exchange with deep history (Coinbase, Bitstamp, Binance US).
 
 ---
 

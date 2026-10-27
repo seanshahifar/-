@@ -11,6 +11,14 @@ from btcagent.market.simulation import SimulatedFeed, generate_bars
 T0 = 1_700_000_000_000  # ms, a whole minute
 
 
+@pytest.fixture(autouse=True)
+def no_page_throttle(monkeypatch):
+    """The page spacing is real time; the other tests shouldn't wait for it."""
+    import btcagent.market.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "PAGE_INTERVAL_SECONDS", 0.0)
+
+
 def rows(n, start=T0, price=100.0):
     return [[start + i * 60_000, price, price + 1, price - 1, price + 0.5, 1.0] for i in range(n)]
 
@@ -227,3 +235,15 @@ def test_the_live_bar_sync_retries_once_then_fails_fast(monkeypatch):
     with pytest.raises(ccxt.RequestTimeout):
         asyncio.run(fetch_recent_bars(down, "BTC/USD", "1m", 10))
     assert pauses == [1.0]  # a long download waits much longer; a per-minute sync must not
+
+
+def test_history_pages_are_spaced_to_respect_public_rate_limits(monkeypatch):
+    import btcagent.market.exchange as exchange_module
+
+    monkeypatch.setattr(exchange_module, "PAGE_INTERVAL_SECONDS", 0.15)
+    monkeypatch.setattr(exchange_module, "_now", lambda: 1_000.0)  # time never advances: every page must wait
+    pauses = record_sleeps(monkeypatch)
+    exchange = PagingExchange(rows(450))
+    frame = asyncio.run(fetch_ohlcv_history(exchange, "BTC/USD", "1m", T0))
+    assert len(frame) == 450 and exchange.calls == 5
+    assert pauses == [0.15] * 4  # no wait before the first page, then one pause per further page

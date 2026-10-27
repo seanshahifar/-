@@ -143,7 +143,10 @@ def train_model(
     """Fit on all of ``bars`` after reporting out-of-sample walk-forward scores in ``model.metrics``."""
     X, y, forward = build_dataset(bars, horizon)
     if len(X) < MIN_TRAINING_SAMPLES:
-        raise ValueError(f"Need at least {MIN_TRAINING_SAMPLES} usable bars to train, got {len(X)}")
+        raise ValueError(
+            f"Need at least {MIN_TRAINING_SAMPLES} usable bars to train, got {len(X)}. The exchange may only serve "
+            "a short price history; use one with deeper history (coinbase, bitstamp, binanceus)."
+        )
     values = X.to_numpy(dtype=float)
 
     splits = list(TimeSeriesSplit(n_splits=n_splits, gap=horizon).split(values))

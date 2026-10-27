@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -21,6 +22,8 @@ OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 DEFAULT_OHLCV_LIMIT = 300
 RETRY_DELAYS = (1.0, 2.0, 5.0, 10.0, 20.0)  # pauses before each retry of a failed page in a long download
 LIVE_RETRY_DELAYS = (1.0,)  # the per-minute live sync retries once, then lets the next minute try again
+PAGE_INTERVAL_SECONDS = 0.15  # public market data is limited to ~10 requests/s per IP (e.g. Coinbase): stay well under
+_now = time.monotonic
 
 
 def create_exchange(cfg: ExchangeConfig, secrets: Secrets | None = None, *, streaming: bool = False):
@@ -146,7 +149,13 @@ async def fetch_ohlcv_history(
     limit = ohlcv_limit(exchange)
     cursor = since_ms
     rows: list[list[float]] = []
+    last_request: float | None = None
     while cursor < until_ms:
+        if PAGE_INTERVAL_SECONDS > 0 and last_request is not None:
+            wait = PAGE_INTERVAL_SECONDS - (_now() - last_request)
+            if wait > 0:
+                await asyncio.sleep(wait)
+        last_request = _now()
         batch = await fetch_page(exchange, symbol, timeframe, cursor, limit, retry_delays)
         if not batch:
             cursor += limit * tf_ms  # no trades in this window (or exchange downtime): skip ahead
