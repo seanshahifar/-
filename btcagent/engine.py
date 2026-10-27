@@ -6,7 +6,7 @@ Concurrent loops:
   * decisions - re-evaluates every ``decision_interval_seconds`` (default 5s)
   * news      - polls feeds, scores headlines (lexicon instantly, Claude when enabled)
   * snapshots - records equity and persists state so a restart resumes where it left off
-  * retrain   - optional: retrains in the background and swaps in a better model
+  * model     - trains a first model in the background if none exists; optionally retrains to keep it fresh
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 SNAPSHOT_SECONDS = 15.0
 PERSIST_SECONDS = 60.0
 BAR_SETTLE_SECONDS = 2.0  # wait this long after a bar closes before fetching it
+MODEL_RETRY_SECONDS = 900.0  # while there is still no model, try training again every 15 minutes
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +74,8 @@ class TradingAgent:
         self.events: deque[dict] = deque(maxlen=200)
         saved = None if fresh else journal.load_state(self._state_key)
         self.paused = False
+        self.training = False  # a model is being trained in the background right now
+        self.train_error: str | None = None  # why the last training attempt failed
         if saved:
             self.ledger = Ledger.from_dict(saved["ledger"])
             self.risk = RiskManager(settings.risk, RiskState(**saved["risk"]))
@@ -116,13 +119,17 @@ class TradingAgent:
             self.event("info", f"Resumed saved {self.mode} state: equity books at ${self.ledger.cash:,.2f} cash")
         self.event("info", f"Agent started in {self.mode.upper()} mode on {self.feed.name} {self.settings.exchange.symbol}")
         if self.model is None:
-            self.event("warn", "No trained model loaded: the agent will watch but not buy. Run `btcagent train`.")
-        await self._sync_bars_safely()
+            if self.settings.model.auto_train:
+                self.event("info", "No trained model yet: training one in the background. The agent watches "
+                                   "but won't buy until it's ready.")
+            else:
+                self.event("warn", "No trained model loaded: the agent will watch but not buy. "
+                                   "Run `btcagent train`.")
         loops = [self._tick_loop(), self._bar_loop(), self._decision_loop(), self._snapshot_loop()]
         if self.news is not None:
             loops.append(self.news.run())
-        if self.settings.model.retrain_every_hours > 0 and self.model is not None:
-            loops.append(self._retrain_loop())
+        if (self.model is None and self.settings.model.auto_train) or self.settings.model.retrain_every_hours > 0:
+            loops.append(self._model_loop())
         try:
             async with asyncio.TaskGroup() as group:  # one loop failing cancels the rest
                 for loop in loops:
@@ -165,6 +172,7 @@ class TradingAgent:
                 self._wake.set()  # act now, don't wait for the next scheduled decision
 
     async def _bar_loop(self) -> None:
+        await self._sync_bars_safely()  # the first sync starts at once, without holding up the other loops
         while True:
             now = self.clock()
             next_close = (math.floor(now / self.tf) + 1) * self.tf
@@ -389,37 +397,78 @@ class TradingAgent:
             except Exception as exc:  # e.g. disk full: keep trading, but say so loudly
                 self.event("error", f"Could not write the journal: {type(exc).__name__}: {exc}")
 
+    async def _model_loop(self) -> None:
+        """Train a first model if there is none, then keep it fresh if retraining is enabled."""
+        cfg = self.settings.model
+        while self.model is None and cfg.auto_train:
+            if await self._train_and_install(first=True):
+                break
+            await asyncio.sleep(MODEL_RETRY_SECONDS)
+        if cfg.retrain_every_hours > 0:
+            await self._retrain_loop()
+
     async def _retrain_loop(self) -> None:
         period = self.settings.model.retrain_every_hours * 3600
         while True:
             await asyncio.sleep(period)
-            try:
-                history = await self.feed.fetch_history(self.settings.model.training_days)
-                history = fill_gaps(clean_bars(drop_incomplete(history, self.tf, self.clock())), self.tf)
-                candidate = await asyncio.to_thread(
-                    train_model, history, self.settings.model.timeframe, self.settings.model.horizon_bars
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.event("warn", f"Background retrain failed: {exc}")
-                continue
-            current_auc = self.model.metrics.get("auc", 0.5) if self.model else 0.5
-            new_auc = candidate.metrics["auc"]
-            if new_auc >= max(0.5, current_auc - 0.005) and candidate.metrics["calibration_slope"] > 0:
-                previous = self.model
+            await self._train_and_install(first=False)
+
+    async def _train_and_install(self, first: bool) -> bool:
+        """Download history, train a candidate and swap it in; returns whether a model was installed.
+
+        The first model is always installed (calibration keeps a weak one from trading); a retrained
+        candidate replaces the current model only if it validates at least as well.
+        """
+        cfg = self.settings.model
+        self.training = True
+        try:
+            if first:
+                self.event("info", f"Training the prediction model: downloading {cfg.training_days} days of "
+                                   "price history first…")
+            history = await self.feed.fetch_history(cfg.training_days)
+            history = fill_gaps(clean_bars(drop_incomplete(history, self.tf, self.clock())), self.tf)
+            candidate = await asyncio.to_thread(train_model, history, cfg.timeframe, cfg.horizon_bars)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.train_error = f"{type(exc).__name__}: {exc}"
+            retry = f"; trying again in {MODEL_RETRY_SECONDS / 60:.0f} min" if first else ""
+            self.event("warn", f"Model training failed: {self.train_error}{retry}")
+            return False
+        finally:
+            self.training = False
+
+        current_auc = self.model.metrics.get("auc", 0.5) if self.model else 0.5
+        new_auc = candidate.metrics["auc"]
+        better = new_auc >= max(0.5, current_auc - 0.005) and candidate.metrics["calibration_slope"] > 0
+        if not (first or better):
+            self.event("info", f"Retrained model rejected (AUC {new_auc:.4f} vs current {current_auc:.4f})")
+            return False
+
+        previous = self.model
+        try:
+            if not self.feed.simulated:
                 try:
-                    if not self.feed.simulated:
-                        candidate.save(self.settings.model.path)
-                    self.model = candidate
-                    self._update_prediction()
-                except Exception as exc:  # never let a retrain take the agent (and its stops) down
-                    self.model = previous
-                    self.event("error", f"Could not swap in the retrained model ({exc}); keeping the current one")
-                    continue
-                self.event("info", f"Model retrained and swapped in (AUC {current_auc:.4f} -> {new_auc:.4f})")
-            else:
-                self.event("info", f"Retrained model rejected (AUC {new_auc:.4f} vs current {current_auc:.4f})")
+                    candidate.save(cfg.path)
+                except Exception as exc:
+                    if not first:
+                        raise
+                    self.event("warn", f"Could not save the model to {cfg.path} ({exc}); using it in memory only, "
+                                       "so it will be trained again after a restart")
+            self.model = candidate
+            self._update_prediction()
+        except Exception as exc:  # never let a retrain take the agent (and its stops) down
+            self.model = previous
+            self.train_error = f"{type(exc).__name__}: {exc}"
+            self.event("error", f"Could not swap in the retrained model ({exc}); keeping the current one")
+            return False
+        self.train_error = None
+        if first:
+            note = "; barely better than chance, so it will rarely trade" if new_auc < 0.52 else ""
+            self.event("info", f"Model trained and ready (out-of-sample AUC {new_auc:.4f}{note})")
+        else:
+            self.event("info", f"Model retrained and swapped in (AUC {current_auc:.4f} -> {new_auc:.4f})")
+        return True
 
     def event(self, kind: str, message: str) -> None:
         self.events.append({"ts": self.clock(), "kind": kind, "message": message})
@@ -503,6 +552,8 @@ class TradingAgent:
             "model": None if self.model is None else self.model.summary() | {"metrics": {
                 k: v for k, v in self.model.metrics.items() if k != "folds"
             }},
+            "model_status": "ready" if self.model is not None else ("training" if self.training else "missing"),
+            "model_error": None if self.model is not None else self.train_error,
             "prices": [list(p) for p in list(self.prices)[::step]],
             "equity_curve": [list(p) for p in self.equity_points],
             "trades": [t.to_dict() for t in list(self.trades)[-50:]][::-1],

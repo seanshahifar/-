@@ -59,3 +59,8 @@ def test_live_mode_needs_the_exact_phrase(monkeypatch):
 def test_secrets_never_appear_in_repr():
     secrets = Secrets(api_key="AKIA-very-secret", api_secret="shh")
     assert "very-secret" not in repr(secrets) and "shh" not in repr(secrets)
+
+
+def test_auto_train_is_on_by_default():
+    assert Settings.load(None).model.auto_train is True
+    assert Settings.load(None, overrides=["model.auto_train=false"]).model.auto_train is False

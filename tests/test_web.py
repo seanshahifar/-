@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from btcagent.broker.paper import PaperBroker
+from btcagent.config import ConfigError
 from btcagent.engine import TradingAgent
 from btcagent.market.simulation import SimulatedFeed
 from btcagent.web.server import CONTROL_HEADER, create_app
@@ -57,10 +58,70 @@ def test_foreign_host_header_is_rejected(agent):
     assert c.get("/api/state").status_code == 400
 
 
-def test_refuses_to_expose_without_a_token(agent):
-    with pytest.raises(ValueError):
+LONG_TOKEN = "k3y-" + "x" * 28
+
+
+def test_refuses_to_expose_without_a_strong_token(agent):
+    with pytest.raises(ConfigError, match="DASHBOARD_TOKEN"):
         create_app(agent, host="0.0.0.0")
-    create_app(agent, host="0.0.0.0", token="t")
+    with pytest.raises(ConfigError, match="too short"):
+        create_app(agent, host="0.0.0.0", token="short")
+    create_app(agent, host="0.0.0.0", token=LONG_TOKEN)
+    create_app(agent, token="short")  # a dashboard only reachable from this machine may use any token
+
+
+def test_healthz_is_public_and_reveals_nothing(agent):
+    c = client(create_app(agent, host="0.0.0.0", token=LONG_TOKEN))
+    response = c.get("/healthz")
+    assert response.status_code == 200 and response.json() == {"ok": True}
+
+
+def test_security_headers_on_every_response(agent):
+    c = client(create_app(agent))
+    for path in ("/", "/healthz", "/api/state"):
+        headers = c.get(path).headers
+        assert headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in headers["content-security-policy"]
+        assert headers["x-content-type-options"] == "nosniff"
+        assert headers["referrer-policy"] == "no-referrer"
+        assert "noindex" in headers["x-robots-tag"]
+    assert c.get("/api/state").headers["cache-control"] == "no-store"
+    assert "strict-transport-security" not in c.get("/").headers
+    assert "max-age" in c.get("/", headers={"x-forwarded-proto": "https"}).headers["strict-transport-security"]
+
+
+def test_a_non_ascii_token_is_rejected_not_a_server_error(agent):
+    c = client(create_app(agent, token="s3cret"))
+    assert c.get("/api/state", headers={"x-dashboard-token": "pässword".encode()}).status_code == 401
+
+
+def test_websocket_needs_the_token_as_its_first_message(agent):
+    c = client(create_app(agent, token=LONG_TOKEN))
+    url = "ws://127.0.0.1:8000/ws"
+    with c.websocket_connect(url) as ws:
+        ws.send_json({"token": LONG_TOKEN})
+        assert ws.receive_json()["mode"] == "sim"
+    for wrong in ({"token": "wrong"}, {"token": 123}, {"unrelated": 1}, {"token": ""}):
+        with c.websocket_connect(url) as ws:
+            ws.send_json(wrong)
+            with pytest.raises(WebSocketDisconnect) as closed:
+                ws.receive_json()
+        assert closed.value.code == 1008
+    with c.websocket_connect(url) as ws:
+        ws.send_text("this is not json")
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_websocket_that_never_authenticates_is_dropped(agent, monkeypatch):
+    import btcagent.web.server as server
+
+    monkeypatch.setattr(server, "AUTH_TIMEOUT_SECONDS", 0.2)
+    c = client(create_app(agent, token=LONG_TOKEN))
+    with c.websocket_connect("ws://127.0.0.1:8000/ws") as ws:
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+    assert closed.value.code == 1008
 
 
 def test_websocket_streams_and_checks_origin(agent):

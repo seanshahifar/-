@@ -2,6 +2,7 @@ import asyncio
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from btcagent.market.exchange import (clean_bars, drop_incomplete, epoch_ms, fetch_ohlcv_history, fill_gaps,
                                       load_bars, merge_bars, rows_to_frame, save_bars)
@@ -166,3 +167,63 @@ def test_stalled_websocket_falls_back_to_rest(monkeypatch):
 
     tick = asyncio.run(asyncio.wait_for(first_tick(), timeout=5))
     assert tick.price == 63_000.0 and feed.source == "polling"
+
+
+# ----------------------------------------------------------------------------- download retries
+class FlakyExchange(PagingExchange):
+    def __init__(self, data, failures, error):
+        super().__init__(data)
+        self.failures, self.error = failures, error
+
+    async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
+        if self.failures:
+            self.failures -= 1
+            raise self.error
+        return await super().fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+
+
+def record_sleeps(monkeypatch):
+    pauses = []
+
+    async def fake_sleep(seconds):
+        pauses.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return pauses
+
+
+def test_history_download_retries_rate_limits_with_growing_pauses(monkeypatch):
+    import ccxt
+
+    pauses = record_sleeps(monkeypatch)
+    exchange = FlakyExchange(rows(50), failures=3, error=ccxt.RateLimitExceeded("slow down"))
+    frame = asyncio.run(fetch_ohlcv_history(exchange, "BTC/USD", "1m", T0))
+    assert len(frame) == 50 and pauses == [1.0, 2.0, 5.0]
+
+
+def test_history_download_gives_up_eventually_and_never_retries_real_errors(monkeypatch):
+    import ccxt
+
+    pauses = record_sleeps(monkeypatch)
+    down = FlakyExchange(rows(50), failures=99, error=ccxt.ExchangeNotAvailable("maintenance"))
+    with pytest.raises(ccxt.ExchangeNotAvailable):
+        asyncio.run(fetch_ohlcv_history(down, "BTC/USD", "1m", T0))
+    assert pauses == [1.0, 2.0, 5.0, 10.0, 20.0]
+
+    pauses.clear()
+    wrong = FlakyExchange(rows(50), failures=99, error=ccxt.BadSymbol("no such market"))
+    with pytest.raises(ccxt.BadSymbol):
+        asyncio.run(fetch_ohlcv_history(wrong, "BTC/USD", "1m", T0))
+    assert pauses == []
+
+
+def test_the_live_bar_sync_retries_once_then_fails_fast(monkeypatch):
+    import ccxt
+
+    from btcagent.market.exchange import fetch_recent_bars
+
+    pauses = record_sleeps(monkeypatch)
+    down = FlakyExchange(rows(50), failures=99, error=ccxt.RequestTimeout("slow"))
+    with pytest.raises(ccxt.RequestTimeout):
+        asyncio.run(fetch_recent_bars(down, "BTC/USD", "1m", 10))
+    assert pauses == [1.0]  # a long download waits much longer; a per-minute sync must not

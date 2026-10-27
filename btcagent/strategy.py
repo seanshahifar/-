@@ -55,7 +55,7 @@ class Strategy:
 
     def should_enter(self, signal: Signal) -> tuple[bool, str]:
         if self.cfg.require_model and signal.p_up is None:
-            return False, "no trained model loaded (run `btcagent train`)"
+            return False, "no trained model yet (it trains automatically at startup, or run `btcagent train`)"
         if signal.combined < self.cfg.entry_threshold:
             return False, f"signal {signal.combined:+.3f} below entry threshold {self.cfg.entry_threshold:+.2f}"
         if signal.edge_bps < signal.required_edge_bps:

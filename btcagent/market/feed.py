@@ -65,6 +65,7 @@ class CcxtFeed(MarketFeed):
                 except Exception as exc:
                     problem = f"no update for {WEBSOCKET_STALL_SECONDS:.0f}s" if isinstance(exc, TimeoutError) else exc
                     log.warning("Websocket feed: %s; using REST polling for %ds", problem, WEBSOCKET_RETRY_SECONDS)
+                    self.last_error = f"websocket: {problem}"
                     self._ws_retry_at = self.clock() + WEBSOCKET_RETRY_SECONDS
                 else:
                     self.source, self.last_error = "websocket", None

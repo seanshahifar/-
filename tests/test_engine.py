@@ -324,3 +324,115 @@ def test_flatten_on_exit_sells_the_position(clock, journal_factory):
     assert agent.ledger.position is None
     assert agent.trades[-1].reason == "shutdown (flatten on exit)"
     assert journal.load_state("sim:agent")["ledger"]["position"] is None
+
+
+# ----------------------------------------------------------------------------- first-boot training
+def make_agent_without_model(clock, journal, *overrides):
+    settings = make_settings(*FAST, "model.horizon_bars=1", *overrides)
+    feed = SimulatedFeed(60, history_bars=3_000, seed=7, clock=clock)
+    agent = TradingAgent(settings, feed, PaperBroker(0, 0, clock), journal, model=None, mode="sim", clock=clock)
+    asyncio.run(agent.sync_bars())
+    return agent, feed
+
+
+def test_the_first_model_is_trained_in_the_background_and_installed(clock, journal_factory):
+    agent, _ = make_agent_without_model(clock, journal_factory())
+    assert agent.snapshot()["model_status"] == "missing"
+    assert asyncio.run(agent._train_and_install(first=True)) is True
+    assert agent.model is not None and agent.prediction is not None
+    snapshot = agent.snapshot()
+    assert snapshot["model_status"] == "ready" and snapshot["model_error"] is None and not agent.training
+    assert any("Model trained and ready" in e["message"] for e in agent.events)
+
+
+def test_training_failure_is_reported_and_never_stops_the_agent(clock, journal_factory, monkeypatch):
+    agent, feed = make_agent_without_model(clock, journal_factory())
+
+    async def unreachable(days):
+        raise ConnectionError("exchange unreachable")
+
+    monkeypatch.setattr(feed, "fetch_history", unreachable)
+    assert asyncio.run(agent._train_and_install(first=True)) is False
+    snapshot = agent.snapshot()
+    assert snapshot["model_status"] == "missing" and "ConnectionError" in snapshot["model_error"]
+    assert not agent.training
+
+
+def test_the_model_loop_retries_every_15_minutes_until_it_succeeds(clock, journal_factory, monkeypatch):
+    agent, feed = make_agent_without_model(clock, journal_factory())
+    real_fetch, attempts, pauses = feed.fetch_history, {"n": 0}, []
+
+    async def flaky(days):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise ConnectionError("down")
+        return await real_fetch(days)
+
+    async def record_pause(seconds):
+        pauses.append(seconds)
+
+    monkeypatch.setattr(feed, "fetch_history", flaky)
+    monkeypatch.setattr(asyncio, "sleep", record_pause)
+    asyncio.run(agent._model_loop())
+    assert attempts["n"] == 3 and pauses == [900.0, 900.0]
+    assert agent.model is not None and agent.snapshot()["model_error"] is None
+
+
+def test_auto_train_can_be_switched_off(clock, journal_factory):
+    agent, _ = make_agent_without_model(clock, journal_factory(), "model.auto_train=false")
+    asyncio.run(agent._model_loop())  # nothing to do: returns immediately
+    assert agent.model is None
+
+
+def test_a_model_that_cannot_be_saved_is_still_used(clock, journal_factory, monkeypatch):
+    import btcagent.engine as engine_module
+
+    class Candidate(FakeModel):
+        def save(self, path):
+            raise PermissionError("read-only disk")
+
+    agent, feed = make_agent_without_model(clock, journal_factory())
+    feed.simulated = False  # pretend it's a real exchange feed, so the model is saved to disk
+    monkeypatch.setattr(engine_module, "train_model", lambda *args, **kwargs: Candidate(0.7))
+    assert asyncio.run(agent._train_and_install(first=True)) is True
+    assert isinstance(agent.model, Candidate)
+    assert any("in memory only" in e["message"] for e in agent.events)
+
+
+def test_a_worse_retrained_model_is_rejected(clock, journal_factory, monkeypatch):
+    import btcagent.engine as engine_module
+
+    class Weak(FakeModel):
+        def __init__(self):
+            super().__init__(0.5)
+            self.metrics = {"auc": 0.5, "calibration_slope": 0.0}
+
+    agent, _ = make_agent(clock, journal_factory())
+    before = agent.model
+    monkeypatch.setattr(engine_module, "train_model", lambda *args, **kwargs: Weak())
+    assert asyncio.run(agent._train_and_install(first=False)) is False
+    assert agent.model is before
+
+
+def test_a_slow_exchange_does_not_hold_up_startup(clock, journal_factory, monkeypatch):
+    import contextlib
+
+    agent, feed = make_agent_without_model(clock, journal_factory())
+    feed.tick_seconds = 0.02
+
+    async def hang(count):
+        await asyncio.Event().wait()  # the exchange never answers the first bar request
+
+    monkeypatch.setattr(feed, "fetch_bars", hang)
+
+    async def scenario():
+        task = asyncio.create_task(agent.run())
+        await asyncio.sleep(0.4)
+        started = (agent.tick is not None,
+                   any("Training the prediction model" in e["message"] for e in agent.events))
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, BaseExceptionGroup):
+            await task
+        return started
+
+    assert asyncio.run(scenario()) == (True, True)  # prices flow and model training began, despite the hang

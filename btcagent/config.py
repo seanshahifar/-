@@ -55,6 +55,7 @@ class ModelConfig:
     horizon_bars: int = 15
     training_days: int = 60
     retrain_every_hours: float = 0.0
+    auto_train: bool = True
 
 
 @dataclass

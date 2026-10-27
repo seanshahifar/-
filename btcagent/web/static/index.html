@@ -206,6 +206,7 @@ dl.facts dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; 
 .event-list .t { color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .event-list .k { color: var(--text-secondary); font-weight: 600; text-transform: uppercase; font-size: 11px; padding-top: 1px; }
 .scroll { max-height: 420px; overflow: auto; }
+.banner, .event-list, .news-list, .decision-reason, .note, .tooltip { overflow-wrap: anywhere; }  /* long URLs wrap instead of clipping */
 .note { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
 
 @media (max-width: 1100px) {
@@ -219,9 +220,29 @@ dl.facts dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; 
   .tile.hero .value { font-size: 40px; }
   .controls { margin-left: 0; }
 }
+.login { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; padding: 16px; background: var(--page); }
+.login[hidden] { display: none; }
+.login-card { width: 100%; max-width: 380px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 20px; display: grid; gap: 10px; }
+.login-card h2 { margin: 0; font-size: 18px; }
+.login-card p { margin: 0; color: var(--text-secondary); font-size: 13px; }
+.login-card label { font-size: 12px; color: var(--text-secondary); }
+.login-card input { font: inherit; padding: 9px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--page); color: var(--text-primary); width: 100%; }
+.login-card button { padding: 9px 12px; font-weight: 600; }
+#login-error { color: var(--down-text); font-size: 12.5px; min-height: 1.2em; }
 </style>
 </head>
 <body>
+<div class="login" id="login" hidden>
+  <form class="login-card" id="login-form">
+    <h2>BTC Agent</h2>
+    <p>This dashboard is password protected. Enter the dashboard token you set when you deployed it (the DASHBOARD_TOKEN value).</p>
+    <input type="text" name="username" value="btcagent" autocomplete="username" aria-hidden="true" tabindex="-1" hidden>
+    <label for="login-token">Dashboard token</label>
+    <input id="login-token" name="password" type="password" autocomplete="current-password" required>
+    <div id="login-error" role="alert"></div>
+    <button type="submit">Open dashboard</button>
+  </form>
+</div>
 <div class="wrap">
   <header class="top">
     <h1>BTC Agent</h1>
@@ -311,9 +332,34 @@ dl.facts dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; 
 
 <script>
 "use strict";
-const params = new URLSearchParams(location.search);
-const TOKEN = params.get("token") || "";
 const $ = (id) => document.getElementById(id);
+// ---------------------------------------------------------------- access token (hosted dashboards)
+const TOKEN_KEY = "btcagent-token";
+let token = "";
+const tokenFromUrl = new URLSearchParams(location.search).get("token");
+if (tokenFromUrl) {  // a link with ?token=... works once: the token stays on this device and leaves the address bar
+  token = tokenFromUrl;
+  try { localStorage.setItem(TOKEN_KEY, tokenFromUrl); } catch { /* storage unavailable: memory only */ }
+  history.replaceState(null, "", location.pathname);
+} else {
+  try { token = localStorage.getItem(TOKEN_KEY) || ""; } catch { /* storage unavailable */ }
+}
+function rememberToken(value) {
+  token = value;
+  try { localStorage.setItem(TOKEN_KEY, value); } catch { /* memory only */ }
+}
+function forgetToken() {
+  token = "";
+  try { localStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
+}
+function showLogin(rejected) {
+  $("login").hidden = false;
+  $("login-error").textContent = rejected ? "That token wasn't accepted. Check it and try again." : "";
+  if (rejected) forgetToken();
+  $("login-token").value = "";
+  $("login-token").focus();
+}
+function hideLogin() { $("login").hidden = true; }
 let state = null;
 let lastMessageAt = 0;
 const tableOpen = { price: false, equity: false };
@@ -669,7 +715,8 @@ function render() {
   $("status-badge").className = "badge " + cls;
   $("status-text").textContent = label;
   const price = s.price;
-  $("market-meta").textContent = `${s.exchange} · ${s.symbol} · prices via ${s.feed_source}` +
+  $("market-meta").textContent = `${s.exchange} · ${s.symbol} · ` +
+    (s.feed_source && s.feed_source !== "-" ? `prices via ${s.feed_source}` : "waiting for prices") +
     (price ? ` · updated ${ago(price.age)}` : "");
   $("btn-pause").textContent = s.status === "paused" ? "Resume buying" : "Pause buying";
 
@@ -825,8 +872,13 @@ function render() {
   mf.replaceChildren();
   const mfact = (k, v) => mf.append(el("dt", {}, k), el("dd", {}, v));
   if (!s.model) {
-    mfact("Status", "No model loaded");
-    $("model-note").textContent = "Run `btcagent download` then `btcagent train`. Without a model the agent watches but never buys.";
+    const training = s.model_status === "training";
+    mfact("Status", training ? "Training in the background…" : "No model yet");
+    $("model-note").textContent = training
+      ? "Downloading recent price history, then training and validating a model. The agent watches but doesn't buy until it's ready."
+      : s.model_error
+        ? `Training failed (${s.model_error}). It retries every 15 minutes. Until then the agent watches but doesn't buy.`
+        : "Run `btcagent download` then `btcagent train`, or set model.auto_train = true. Without a model the agent watches but never buys.";
   } else {
     const mm = s.model.metrics;
     mfact("Predicts", `direction over the next ${s.model.horizon_bars} × ${s.model.timeframe} bars`);
@@ -842,18 +894,38 @@ function render() {
 }
 
 // ---------------------------------------------------------------- live connection
+const WS_POLICY_VIOLATION = 1008;  // the server's "wrong or missing token"
 let backoff = 1000;
+let socket = null;
+let reconnectTimer = null;
 function connect() {
+  clearTimeout(reconnectTimer);
+  if (socket) { socket.onclose = null; socket.close(); }
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`);
+  const ws = socket = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => ws.send(JSON.stringify({ token }));  // the token travels in a message, never in a URL
   ws.onmessage = (event) => {
     backoff = 1000;
     lastMessageAt = Date.now() / 1000;
+    hideLogin();
     state = JSON.parse(event.data);
     render();
   };
-  ws.onclose = () => { setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 15000); };
+  ws.onclose = (event) => {
+    if (ws !== socket) return;
+    if (event.code === WS_POLICY_VIOLATION) { showLogin(Boolean(token)); return; }
+    reconnectTimer = setTimeout(connect, backoff);
+    backoff = Math.min(backoff * 2, 15000);
+  };
 }
+$("login-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const value = $("login-token").value.trim();
+  if (!value) return;
+  rememberToken(value);
+  $("login-error").textContent = "";
+  connect();
+});
 setInterval(() => { if (state) render(); }, 2000);  // keeps "disconnected" state honest
 window.addEventListener("resize", () => { if (state) render(); });
 connect();
@@ -861,8 +933,9 @@ connect();
 // ---------------------------------------------------------------- controls
 async function control(action) {
   const headers = { "x-btcagent-control": "1" };
-  if (TOKEN) headers["x-dashboard-token"] = TOKEN;
+  if (token) headers["x-dashboard-token"] = token;
   const response = await fetch(`/api/control/${action}`, { method: "POST", headers });
+  if (response.status === 401) { showLogin(true); return; }
   if (!response.ok) {
     let detail = String(response.status);
     try { detail = (await response.json()).detail || detail; } catch { /* not JSON */ }

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 import sys
 import time
@@ -63,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def env_overrides() -> list[str]:
+    """Config overrides from $BTCAGENT_SET (space separated ``section.key=value``), for hosts where
+    config.toml can't be edited. Command-line ``--set`` flags still win."""
+    return os.environ.get("BTCAGENT_SET", "").split()
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
@@ -74,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     for noisy in ("ccxt", "httpx", "httpx2", "anthropic", "urllib3", "asyncio", "uvicorn.error"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     try:
-        settings = Settings.load(args.config, args.set)
+        settings = Settings.load(args.config, [*env_overrides(), *args.set])
         handler = {"download": cmd_download, "train": cmd_train, "backtest": cmd_backtest,
                    "run": cmd_run, "news": cmd_news}[args.command]
         return handler(settings, args) or 0
@@ -257,16 +264,26 @@ def load_model(settings: Settings):
     from btcagent.model import TrainedModel
 
     path = Path(settings.model.path)
+    auto = settings.model.auto_train
     if not path.exists():
-        log.warning("No trained model at %s: the agent will watch but not buy. Run `btcagent download` "
-                    "then `btcagent train`.", path)
+        if auto:
+            log.info("No trained model at %s yet: one will be trained in the background.", path)
+        else:
+            log.warning("No trained model at %s: the agent will watch but not buy. Run `btcagent download` "
+                        "then `btcagent train`.", path)
         return None
-    model = TrainedModel.load(path)
-    if model.timeframe != settings.model.timeframe or model.horizon_bars != settings.model.horizon_bars:
-        raise ConfigError(
-            f"The saved model predicts {model.horizon_bars} x {model.timeframe} bars, but config.toml says "
-            f"{settings.model.horizon_bars} x {settings.model.timeframe}. Retrain with `btcagent train`."
-        )
+    try:
+        model = TrainedModel.load(path)
+        if model.timeframe != settings.model.timeframe or model.horizon_bars != settings.model.horizon_bars:
+            raise ConfigError(
+                f"The saved model predicts {model.horizon_bars} x {model.timeframe} bars, but config.toml says "
+                f"{settings.model.horizon_bars} x {settings.model.timeframe}. Retrain with `btcagent train`."
+            )
+    except Exception as exc:
+        if not auto:
+            raise
+        log.warning("Can't use the saved model (%s); training a new one in the background.", exc)
+        return None
     return model
 
 
@@ -329,8 +346,10 @@ async def run_agent(settings: Settings, args: argparse.Namespace, dashboard: boo
 
         app = create_app(agent, host=host, token=settings.secrets.dashboard_token)
         server = make_server(uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False))
-        query = f"?token={settings.secrets.dashboard_token}" if settings.secrets.dashboard_token else ""
-        log.info("Dashboard: http://%s:%d/%s", "localhost" if host in ("127.0.0.1", "::1") else host, port, query)
+        if host in ("127.0.0.1", "::1", "localhost"):
+            log.info("Dashboard: http://localhost:%d/", port)
+        else:  # logs are often stored and shared, so the token is never printed
+            log.info("Dashboard listening on %s:%d (password protected by DASHBOARD_TOKEN)", host, port)
 
     stop = asyncio.Event()  # SIGTERM (e.g. `systemctl stop`) shuts down as gracefully as Ctrl-C
     with contextlib.suppress(NotImplementedError, RuntimeError):

@@ -26,6 +26,7 @@ timeframe = "1m"           # bar size the model is trained on: 1m, 5m, 15m, 30m,
 horizon_bars = 15          # the model predicts the direction of the next N bars (15 x 1m = 15 minutes)
 training_days = 60         # history used by `btcagent train`
 retrain_every_hours = 0    # >0 retrains in the background and swaps in the new model only if it validates
+auto_train = true          # no trained model yet? download history and train one in the background at startup
 
 [strategy]
 decision_interval_seconds = 5   # how often the agent re-evaluates (it can act every few seconds)

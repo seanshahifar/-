@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from pathlib import Path
 
+import ccxt
 import ccxt.async_support as ccxt_async
 import ccxt.pro as ccxt_pro
 import numpy as np
@@ -17,6 +19,8 @@ log = logging.getLogger(__name__)
 
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 DEFAULT_OHLCV_LIMIT = 300
+RETRY_DELAYS = (1.0, 2.0, 5.0, 10.0, 20.0)  # pauses before each retry of a failed page in a long download
+LIVE_RETRY_DELAYS = (1.0,)  # the per-minute live sync retries once, then lets the next minute try again
 
 
 def create_exchange(cfg: ExchangeConfig, secrets: Secrets | None = None, *, streaming: bool = False):
@@ -107,11 +111,24 @@ def ohlcv_limit(exchange) -> int:
     return int(limit) if limit else DEFAULT_OHLCV_LIMIT
 
 
+async def fetch_page(
+    exchange, symbol: str, timeframe: str, since: int, limit: int, retry_delays: tuple[float, ...] = RETRY_DELAYS
+) -> list[list[float]]:
+    """One page of bars, retrying timeouts, rate limits and temporary outages after the given pauses."""
+    for delay in retry_delays:
+        try:
+            return await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+        except ccxt.NetworkError as exc:
+            log.warning("Price history request failed (%s); retrying in %.0fs", type(exc).__name__, delay)
+            await asyncio.sleep(delay)
+    return await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+
+
 async def fetch_recent_bars(exchange, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
     """Most recent ``count`` bars (the last one may still be in progress)."""
     tf_ms = TIMEFRAME_SECONDS[timeframe] * 1000
     since = exchange.milliseconds() - count * tf_ms
-    return await fetch_ohlcv_history(exchange, symbol, timeframe, since)
+    return await fetch_ohlcv_history(exchange, symbol, timeframe, since, retry_delays=LIVE_RETRY_DELAYS)
 
 
 async def fetch_ohlcv_history(
@@ -121,6 +138,7 @@ async def fetch_ohlcv_history(
     since_ms: int,
     until_ms: int | None = None,
     progress: Callable[[int, int], None] | None = None,
+    retry_delays: tuple[float, ...] = RETRY_DELAYS,
 ) -> pd.DataFrame:
     """Download OHLCV bars in pages from ``since_ms`` up to ``until_ms`` (default: now)."""
     tf_ms = TIMEFRAME_SECONDS[timeframe] * 1000
@@ -129,7 +147,7 @@ async def fetch_ohlcv_history(
     cursor = since_ms
     rows: list[list[float]] = []
     while cursor < until_ms:
-        batch = await exchange.fetch_ohlcv(symbol, timeframe, since=cursor, limit=limit)
+        batch = await fetch_page(exchange, symbol, timeframe, cursor, limit, retry_delays)
         if not batch:
             cursor += limit * tf_ms  # no trades in this window (or exchange downtime): skip ahead
             continue

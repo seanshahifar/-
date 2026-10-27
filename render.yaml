@@ -1,0 +1,19 @@
+# Render Blueprint: deploys the trading agent and its dashboard as one always-on web service.
+# In Render: New > Blueprint > pick this repository. See "Get a web link" in README.md.
+#
+# Paper trading only (simulated money, real prices). Add exchange keys and enable live trading
+# only after weeks of paper results you trust: see README.md.
+services:
+  - type: web
+    name: btcagent
+    runtime: docker
+    plan: starter            # always-on; the free plan sleeps (the agent would stop) and has no persistent disk
+    healthCheckPath: /healthz
+    autoDeploy: false        # redeploy only when you click Manual Deploy, so a push never restarts the agent
+    disk:
+      name: btcagent-data    # trade journal, trained model and downloaded prices survive restarts
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DASHBOARD_TOKEN # your dashboard password; Render generates a strong one (see README to find it)
+        generateValue: true

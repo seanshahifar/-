@@ -51,7 +51,7 @@ btcagent backtest             # 4. out-of-sample backtest plus a fee-sensitivity
 btcagent run                  # 5. paper trade on live prices -> http://localhost:8000
 ```
 
-`btcagent news` fetches and scores the current headlines once, which is handy for checking your news setup.
+`btcagent run` also trains a model in the background by itself when it finds none (`model.auto_train`), so steps 2–3 are optional. They're still the way to see the validation scores before you start. `btcagent news` fetches and scores the current headlines once, which is handy for checking your news setup.
 
 Any setting can be overridden from the command line without editing `config.toml`:
 
@@ -59,6 +59,52 @@ Any setting can be overridden from the command line without editing `config.toml
 btcagent run --set trading.fee_rate=0.001 --set risk.max_position_usd=250
 btcagent --set exchange.id=kraken --set exchange.symbol=BTC/USD run
 ```
+
+On a host where you can't edit files, put the same overrides, space separated, in the `BTCAGENT_SET` environment variable: `BTCAGENT_SET="trading.fee_rate=0.001 risk.max_position_usd=250"`.
+
+---
+
+## Get a web link (host it online)
+
+To open the dashboard from your phone, run the agent on an always-on host. This repository is ready for [Render](https://render.com): it contains a `Dockerfile` and a Blueprint (`render.yaml`) that creates the service and its storage disk in a few clicks. It runs **paper trading** (simulated money, real prices).
+
+**Cost.** Render's Starter web service is about $7/month (always on, 512 MB RAM) plus about $0.25/month for the 1 GB disk. Check Render's pricing page for current numbers. The free plan won't work: it goes to sleep (the agent would stop and its stop-losses wouldn't be enforced) and has no persistent disk.
+
+**Steps**
+
+1. Create a Render account and connect your GitHub account.
+2. In Render choose **New → Blueprint**, then pick this repository (and allow Render to read it if asked). Render reads `render.yaml`, shows the web service and disk it will create, and asks you to confirm. Click **Apply**.
+3. Wait for the first build (a few minutes). When it finishes, Render shows your address, like `https://btcagent-xxxx.onrender.com`.
+4. Open the service's **Environment** tab, find `DASHBOARD_TOKEN` (Render generated a long random value) and copy it. It is your dashboard password.
+5. Open your address and paste the token when asked. That browser remembers it, so you only do this once per device. Bookmark the address.
+
+**First start.** With no model yet, the agent downloads about 60 days of prices and trains one in the background (a minute or two). The dashboard shows "Training in the background…" and the agent doesn't buy until the model is ready. It re-trains automatically if the saved model doesn't fit your settings, and retries every 15 minutes if the exchange can't be reached.
+
+**Settings.** Edit `config.toml` in your repository and use **Manual Deploy**, or add environment variables in Render's **Environment** tab (the service restarts when you save):
+
+| Variable | Use |
+|---|---|
+| `BTCAGENT_SET` | Space-separated overrides, e.g. `trading.fee_rate=0.004 risk.max_position_usd=250 exchange.id=kraken` |
+| `ANTHROPIC_API_KEY` | Turns on Claude news scoring |
+| `DASHBOARD_TOKEN` | Your dashboard password: at least 16 characters (change it any time) |
+
+**Updating.** Automatic deploys are off on purpose, so pushing code never restarts the agent. Use **Manual Deploy → Deploy latest commit** when you want an update. While it restarts (about a minute), the agent isn't watching prices, so stops aren't enforced.
+
+**Safety.**
+
+- The dashboard refuses to start without a token of at least 16 characters, checks it on every request and WebSocket connection, can't be embedded in other websites, isn't indexed by search engines, and never writes the token to the logs. Keep it private.
+- The disk at `/data` holds the trade journal, trained model and downloaded prices. Don't delete it unless you want to start over.
+- Don't switch to live trading on a hosted agent until you have weeks of paper results you trust. See [Going live](#going-live): the exchange keys go in environment variables, never in the repository.
+- Any other host that runs Docker works too: it needs `DASHBOARD_TOKEN`, a volume mounted at `/data`, HTTPS in front of it (the token is sent with every request, so don't expose it over plain HTTP), and `PORT` if the host assigns one.
+
+**If something looks wrong**
+
+| What you see | Likely cause |
+|---|---|
+| Asks for the token again and again | The token in Render's **Environment** tab differs from what you typed. Copy it again. |
+| "Can't get prices from …" | The exchange blocks the host's region. Choose another with `BTCAGENT_SET=exchange.id=kraken` (or change Render's region). |
+| Model card says training failed | The reason is shown there. The agent retries every 15 minutes. |
+| The build or start fails | Open the service's **Logs** tab. A missing or short token shows a clear message. |
 
 ---
 
@@ -121,7 +167,8 @@ In live mode the agent keeps its **own books**: it never spends more than `tradi
 - **Model:** a small, heavily regularised gradient-boosted classifier (scikit-learn) that predicts whether the price will be higher after the horizon.
 - **Validation:** purged walk-forward. Every reported score is measured on data that comes strictly after the training data, with a gap so labels can't leak.
 - **Calibration:** probabilities are re-fitted on those out-of-sample predictions. A model with no real skill gets its probabilities pulled back to ~50%, so **the agent cannot trade on false confidence.** `btcagent train` warns when the AUC is close to a coin flip.
-- **Retraining:** run `btcagent download && btcagent train` periodically, or set `model.retrain_every_hours`. The agent then retrains in the background and swaps in the new model only if it validates at least as well.
+- **Training:** `btcagent run` trains a first model in the background if none exists (`model.auto_train`). To see the validation scores up front, run `btcagent download && btcagent train`.
+- **Retraining:** run those periodically, or set `model.retrain_every_hours`. The agent then retrains in the background and swaps in the new model only if it validates at least as well.
 
 `btcagent backtest` trains on everything before the last 7 days and simulates those unseen 7 days with the same strategy, risk and fee code the live agent uses. It reports return vs. buy-and-hold, drawdown, Sharpe ratio, win rate and fees, plus a table showing how the results change across fee levels. Backtests have no historical news, so the news signal is neutral there.
 
@@ -165,7 +212,7 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-To view the dashboard remotely, prefer an SSH tunnel (`ssh -L 8000:localhost:8000 server`). If you bind it to a public address instead, `DASHBOARD_TOKEN` is mandatory and you open `http://host:8000/?token=…`.
+To view the dashboard remotely, prefer an SSH tunnel (`ssh -L 8000:localhost:8000 server`). If you bind it to a public address instead (`--host 0.0.0.0`), `DASHBOARD_TOKEN` (at least 16 characters) is mandatory, the page asks for it on the first visit, and you should put HTTPS in front of it. To go live on a hosted agent, set `BTCAGENT_SET=trading.mode=live` together with the exchange keys and `BTCAGENT_LIVE_CONFIRM` as environment variables, and keep the persistent disk: the agent's books must survive restarts.
 
 **Exchanges:** any [ccxt](https://github.com/ccxt/ccxt) exchange id works (`coinbase`, `kraken`, `binance`, `binanceus`, `bitstamp`, `gemini`, …). Use `BTC/USDT` where the exchange quotes in USDT. Kraken's OHLC endpoint only serves the most recent 720 bars, so for training data use `btcagent download --exchange coinbase` (or bitstamp) and keep trading on Kraken.
 
@@ -191,6 +238,9 @@ btcagent/
   web/              FastAPI dashboard server and the single-page UI
 tests/              pytest suite
 config.toml         every setting, documented inline
+Dockerfile          container image for hosting (state in /data)
+deploy/             container entrypoint and pinned dependency versions
+render.yaml         Render Blueprint: web service + persistent disk
 ```
 
 ## Tests
@@ -199,7 +249,7 @@ config.toml         every setting, documented inline
 pytest
 ```
 
-The suite covers config validation, look-ahead-free features, model calibration on data with and without a learnable pattern, the lexicon and news pipeline, the Claude scorer (run through the real Anthropic SDK against a mocked HTTP transport), every risk rule, ledger accounting, the paper and live brokers (against a fake exchange, including timeouts, lost orders, cancellations and balance reconciliation), backtest accounting and gap fills, the agent's decision loop (stops, news shocks, kill switch, pause, dust, shutdown mid-order, restart and resume) and the dashboard's security checks.
+The suite covers config validation, look-ahead-free features, model calibration on data with and without a learnable pattern, the lexicon and news pipeline, the Claude scorer (run through the real Anthropic SDK against a mocked HTTP transport), every risk rule, ledger accounting, the paper and live brokers (against a fake exchange, including timeouts, lost orders, cancellations and balance reconciliation), backtest accounting and gap fills, the agent's decision loop (stops, news shocks, kill switch, pause, dust, shutdown mid-order, restart and resume), first-boot model training and download retries, and the dashboard's security checks (token rules, WebSocket authentication, headers, no token in logs).
 
 ## Limitations and ideas
 
