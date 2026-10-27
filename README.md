@@ -108,7 +108,9 @@ It trades **spot, long-only**: it buys BTC when it expects a rise and sells back
 | News shock | news score ≤ −0.5 | Sells and pauses buying for 30 minutes |
 | Kill switch button | — | Dashboard button: sell everything at market, halt until reset |
 
-In live mode the agent keeps its **own books**: it never spends more than `trading.capital_usd`, never more than your free balance, and **only sells BTC it bought itself**, never coins that were already in your account. State is saved to `data/journal.db`, so a restart resumes where it left off.
+In live mode the agent keeps its **own books**: it never spends more than `trading.capital_usd`, never more than your free balance, and **only sells BTC it bought itself**, never coins that were already in your account. State is saved to `data/journal.db`, so a restart resumes where it left off (including a pause, and an updated `capital_usd`).
+
+**Orders are never forgotten.** If the exchange stops answering mid-order, the agent keeps checking. It cancels an order that doesn't finish within 30 s, and works out what executed from the change in your BTC balance. If it still can't tell, it halts trading until you check your account and press **Reset limits**. Shutting down mid-order lets that order finish and be recorded first.
 
 ---
 
@@ -197,7 +199,7 @@ config.toml         every setting, documented inline
 pytest
 ```
 
-The suite covers config validation, look-ahead-free features, model calibration on data with and without a learnable pattern, the lexicon and news pipeline, the Claude scorer (run through the real Anthropic SDK against a mocked HTTP transport), every risk rule, ledger accounting, the paper and live brokers (against a fake exchange), backtest accounting and gap-through-stop fills, the agent's decision loop (stops, news shocks, kill switch, pause, restart and resume) and the dashboard's security checks.
+The suite covers config validation, look-ahead-free features, model calibration on data with and without a learnable pattern, the lexicon and news pipeline, the Claude scorer (run through the real Anthropic SDK against a mocked HTTP transport), every risk rule, ledger accounting, the paper and live brokers (against a fake exchange, including timeouts, lost orders, cancellations and balance reconciliation), backtest accounting and gap fills, the agent's decision loop (stops, news shocks, kill switch, pause, dust, shutdown mid-order, restart and resume) and the dashboard's security checks.
 
 ## Limitations and ideas
 

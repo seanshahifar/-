@@ -78,6 +78,12 @@ class RiskManager:
         s.peak_equity = equity
         s.day, s.day_start_equity = utc_day(now), equity
 
+    def rebase(self, delta: float) -> None:
+        """Capital was added or withdrawn: shift the equity baselines so it isn't mistaken for P&L."""
+        s = self.state
+        s.peak_equity = max(0.0, s.peak_equity + delta)
+        s.day_start_equity = max(0.0, s.day_start_equity + delta)
+
     def news_shock(self, news_score: float, now: float) -> bool:
         """Very negative news pauses new buys for a while (and the engine sells)."""
         if news_score > self.cfg.news_shock_threshold:

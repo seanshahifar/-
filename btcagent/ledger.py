@@ -56,25 +56,44 @@ class Ledger:
             pos.qty, pos.cost_usd = total_qty, pos.cost_usd + cost
         return TradeRecord(fill.ts, "buy", fill.qty, fill.price, fill.fee_usd, reason)
 
-    def apply_sell(self, fill: Fill, reason: str = "") -> TradeRecord:
+    def apply_sell(self, fill: Fill, reason: str = "", close_remainder: bool = False) -> TradeRecord:
+        """Book a sell. ``close_remainder`` closes the position even if a little is left: an unsellable
+        dust remainder is written off into this trade's P&L instead of lingering as a fake position."""
         pos = self.position
         if pos is None or fill.qty <= 0:
             raise ValueError("sell without an open position")
         qty = min(fill.qty, pos.qty)
         proceeds = qty * fill.price - fill.fee_usd
-        cost_share = pos.cost_usd * (qty / pos.qty)
+        cost_share = pos.cost_usd if close_remainder else pos.cost_usd * (qty / pos.qty)
         pnl = proceeds - cost_share
         self.cash += proceeds
         self.fees_paid += fill.fee_usd
         self.realized_pnl += pnl
         remaining = pos.qty - qty
-        if remaining <= pos.qty * 1e-9:
+        if close_remainder or remaining <= pos.qty * 1e-9:
             self.position = None
             self.round_trips += 1
             self.wins += pnl > 0
         else:
             pos.qty, pos.cost_usd = remaining, pos.cost_usd - cost_share
         return TradeRecord(fill.ts, "sell", qty, fill.price, fill.fee_usd, reason, pnl_usd=pnl)
+
+    def write_off_position(self) -> float:
+        """Drop a position too small to sell (dust) from the books; returns the realised loss."""
+        pos = self.position
+        if pos is None:
+            return 0.0
+        self.realized_pnl -= pos.cost_usd
+        self.position = None
+        self.round_trips += 1
+        return -pos.cost_usd
+
+    def rebase_capital(self, capital_usd: float) -> float:
+        """Apply a changed ``capital_usd`` as a deposit / withdrawal of cash; returns the change."""
+        delta = capital_usd - self.capital
+        self.capital = capital_usd
+        self.cash = max(0.0, self.cash + delta)
+        return delta
 
     def to_dict(self) -> dict:
         return {

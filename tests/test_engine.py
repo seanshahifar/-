@@ -143,20 +143,153 @@ def test_snapshot_is_strict_json(clock, journal_factory):
     assert snapshot["model"]["metrics"]["auc"] is None
 
 
-class BrokenSellBroker(PaperBroker):
+class MinimumOrderBroker(PaperBroker):
+    """Paper broker with an exchange-style $10 minimum order and a configurable sell outcome."""
+
+    def __init__(self, clock, sell_error=None, sell_fraction=1.0):
+        super().__init__(0, 0, clock)
+        self.sell_error = sell_error
+        self.sell_fraction = sell_fraction
+
+    def is_sellable(self, qty, price):
+        return qty * price >= 10
+
     async def sell(self, qty, tick):
-        raise RuntimeError("amount below exchange minimum")
+        if self.sell_error is not None:
+            raise self.sell_error
+        return await super().sell(qty * self.sell_fraction, tick)
 
 
-def test_unsellable_dust_is_written_off_not_retried_forever(clock, journal_factory):
+def test_unsellable_dust_is_written_off_without_an_order(clock, journal_factory):
     agent, feed = make_agent(clock, journal_factory())
     agent.on_tick(feed.step(clock()))
     asyncio.run(agent.decide())
-    agent.ledger.position.qty = 1e-7  # a few cents' worth
-    agent.broker = BrokenSellBroker(0, 0, clock)
+    agent.ledger.position.qty = 1e-7  # a fraction of a cent
+    agent.broker = MinimumOrderBroker(clock, sell_error=AssertionError("must not try to sell dust"))
     asyncio.run(agent.kill())
     assert agent.ledger.position is None
     assert any("dust" in e["message"] for e in agent.events)
+
+
+def test_a_failed_sell_never_writes_the_position_off(clock, journal_factory):
+    agent, feed = make_agent(clock, journal_factory())
+    agent.on_tick(feed.step(clock()))
+    asyncio.run(agent.decide())
+    agent.broker = MinimumOrderBroker(clock, sell_error=RuntimeError("exchange timeout"))
+    asyncio.run(agent.kill())
+    assert agent.ledger.position is not None  # still tracked, still protected, retried next cycle
+
+
+def test_a_dust_remainder_after_a_sell_closes_the_round_trip(clock, journal_factory):
+    agent, feed = make_agent(clock, journal_factory())
+    agent.on_tick(feed.step(clock()))
+    asyncio.run(agent.decide())
+    agent.broker = MinimumOrderBroker(clock, sell_fraction=0.9999)  # leaves ~5 cents behind
+    clock.advance(5)
+    agent.on_tick(tick_at(agent.ledger.position.entry_price * 0.98, clock))
+    assert asyncio.run(agent.decide()).action == "sell"
+    assert agent.ledger.position is None and agent.ledger.round_trips == 1
+
+
+def test_unknown_order_outcome_halts_trading(clock, journal_factory):
+    from btcagent.broker.base import OrderStatusUnknown
+
+    class LostBroker(PaperBroker):
+        async def buy(self, usd, tick):
+            raise OrderStatusUnknown("exchange stopped answering")
+
+    agent, feed = make_agent(clock, journal_factory())
+    agent.broker = LostBroker(0, 0, clock)
+    agent.on_tick(feed.step(clock()))
+    decision = asyncio.run(agent.decide())
+    assert decision.action == "hold" and "outcome unknown" in decision.reason
+    assert agent.risk.state.killed
+
+
+def test_an_order_in_flight_is_booked_even_during_shutdown(clock, journal_factory):
+    release = asyncio.Event()
+
+    class SlowBroker(PaperBroker):
+        async def buy(self, usd, tick):
+            await release.wait()  # the exchange is still working on it...
+            return await super().buy(usd, tick)
+
+    agent, feed = make_agent(clock, journal_factory())
+    agent.broker = SlowBroker(0, 0, clock)
+    agent.on_tick(feed.step(clock()))
+
+    async def scenario():
+        decision = asyncio.create_task(agent.decide())
+        await asyncio.sleep(0.01)
+        decision.cancel()  # Ctrl-C / SIGTERM arrives mid-order
+        await asyncio.sleep(0.01)
+        release.set()  # ...and the order completes anyway
+        with pytest.raises(asyncio.CancelledError):
+            await decision
+
+    asyncio.run(scenario())
+    assert agent.ledger.position is not None  # the fill was booked, not lost
+
+
+def test_pause_survives_a_restart(clock, journal_factory):
+    journal = journal_factory()
+    agent, _ = make_agent(clock, journal)
+    agent.pause()
+    restarted, _ = make_agent(clock, journal)
+    assert restarted.paused
+
+
+def test_reset_needs_a_price_first(clock, journal_factory):
+    agent, feed = make_agent(clock, journal_factory())
+    with pytest.raises(ValueError, match="first price"):
+        agent.reset()
+    agent.on_tick(feed.step(clock()))
+    agent.reset()
+
+
+def test_a_changed_capital_setting_is_applied_on_resume(clock, journal_factory):
+    journal = journal_factory()
+    agent, feed = make_agent(clock, journal)
+    agent.on_tick(feed.step(clock()))
+    asyncio.run(agent.decide())  # sets the risk baselines at $10,000
+    agent.persist()
+
+    settings = make_settings(*FAST, "trading.capital_usd=1000")
+    feed2 = SimulatedFeed(60, history_bars=400, seed=7, clock=clock)
+    smaller = TradingAgent(settings, feed2, PaperBroker(0, 0, clock), journal, model=FakeModel(0.8), mode="sim",
+                           clock=clock)
+    assert smaller.ledger.capital == 1000
+    assert smaller.ledger.cash == pytest.approx(agent.ledger.cash - 9000)
+    assert smaller.risk.state.peak_equity == pytest.approx(agent.risk.state.peak_equity - 9000)
+    asyncio.run(smaller.sync_bars())
+    smaller.on_tick(feed2.step(clock()))
+    decision = asyncio.run(smaller.decide())
+    assert "drawdown" not in decision.reason  # a withdrawal isn't a loss
+
+
+def test_a_failing_model_save_does_not_stop_the_agent(clock, journal_factory, monkeypatch):
+    import btcagent.engine as engine_module
+
+    class Candidate(FakeModel):
+        def save(self, path):
+            raise PermissionError("models/ is read-only")
+
+    agent, feed = make_agent(clock, journal_factory())
+    original_model = agent.model
+    agent.feed.simulated = False  # pretend it's a real feed so the model gets saved
+    monkeypatch.setattr(engine_module, "train_model", lambda *a, **k: Candidate(0.7))
+    sleeps = {"n": 0}
+
+    async def sleep(_seconds):
+        sleeps["n"] += 1
+        if sleeps["n"] > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(agent._retrain_loop())
+    assert agent.model is original_model
+    assert any("Could not swap in" in e["message"] for e in agent.events)
 
 
 def test_feed_errors_are_survived(clock, journal_factory, monkeypatch):

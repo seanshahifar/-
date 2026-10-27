@@ -129,3 +129,40 @@ def test_ccxt_feed_reports_why_prices_stopped(monkeypatch):
     except asyncio.CancelledError:
         pass
     assert feed.last_error == "ConnectionError: exchange unreachable"
+
+
+def test_stalled_websocket_falls_back_to_rest(monkeypatch):
+    import btcagent.market.feed as feed_module
+    from btcagent.config import ExchangeConfig
+    from btcagent.market.feed import CcxtFeed
+
+    class SilentStream:
+        async def watch_ticker(self, symbol):
+            await asyncio.Event().wait()  # connected, but never sends anything
+
+        async def close(self):
+            pass
+
+    class Rest:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_ticker(self, symbol):
+            self.calls += 1
+            return {"last": 63_000.0, "bid": 62_999.0, "ask": 63_001.0, "timestamp": None}
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(feed_module, "WEBSOCKET_STALL_SECONDS", 0.05)
+    feed = CcxtFeed(ExchangeConfig(), "1m")
+    asyncio.run(feed.rest.close())
+    asyncio.run(feed.stream.close())
+    feed.stream, feed.rest = SilentStream(), Rest()
+
+    async def first_tick():
+        async for tick in feed.ticks():
+            return tick
+
+    tick = asyncio.run(asyncio.wait_for(first_tick(), timeout=5))
+    assert tick.price == 63_000.0 and feed.source == "polling"

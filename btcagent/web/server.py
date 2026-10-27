@@ -65,7 +65,10 @@ def create_app(agent: TradingAgent, host: str = "127.0.0.1", token: str = "") ->
         elif action == "kill":
             await agent.kill()
         elif action == "reset":
-            agent.reset()
+            try:
+                agent.reset()
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         else:
             raise HTTPException(status_code=404, detail=f"unknown action {action!r}")
         return JSONResponse({"ok": True, "status": agent.snapshot()["status"]})

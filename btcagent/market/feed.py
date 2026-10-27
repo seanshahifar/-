@@ -17,6 +17,7 @@ from btcagent.market.exchange import create_exchange, fetch_ohlcv_history, fetch
 log = logging.getLogger(__name__)
 
 WEBSOCKET_RETRY_SECONDS = 60.0
+WEBSOCKET_STALL_SECONDS = 15.0  # BTC tickers update many times a second; silence this long means a dead stream
 
 
 class MarketFeed(ABC):
@@ -58,11 +59,12 @@ class CcxtFeed(MarketFeed):
         while True:
             if self.stream is not None and self.clock() >= self._ws_retry_at:
                 try:
-                    ticker = await self.stream.watch_ticker(self.cfg.symbol)
+                    ticker = await asyncio.wait_for(self.stream.watch_ticker(self.cfg.symbol), WEBSOCKET_STALL_SECONDS)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    log.warning("Websocket feed error (%s); using REST polling for %ds", exc, WEBSOCKET_RETRY_SECONDS)
+                    problem = f"no update for {WEBSOCKET_STALL_SECONDS:.0f}s" if isinstance(exc, TimeoutError) else exc
+                    log.warning("Websocket feed: %s; using REST polling for %ds", problem, WEBSOCKET_RETRY_SECONDS)
                     self._ws_retry_at = self.clock() + WEBSOCKET_RETRY_SECONDS
                 else:
                     self.source, self.last_error = "websocket", None

@@ -69,14 +69,19 @@ def run_backtest(
     for k, i in enumerate(range(first, len(bars))):
         bar_open, bar_close = starts[i], starts[i] + tf
 
-        # Intrabar: a position held into this bar can hit its stop (checked first) or its target.
+        # A position held into this bar: a gap through a level fills at the open; otherwise the stop is
+        # checked before the target (a bar touching both counts as a stop-out).
         position = ledger.position
         if position is not None:
             stop, target = risk.stop_price(position), risk.take_profit_price(position)
-            if lows[i] <= stop:
-                sell(min(opens[i], stop), bar_open, "stop (intrabar)")
+            if opens[i] <= stop:
+                sell(opens[i], bar_open, "stop (gap)")
+            elif target is not None and opens[i] >= target:
+                sell(opens[i], bar_open, "take profit (gap)")
+            elif lows[i] <= stop:
+                sell(stop, bar_open, "stop (intrabar)")
             elif target is not None and highs[i] >= target:
-                sell(max(opens[i], target), bar_open, "take profit (intrabar)")
+                sell(target, bar_open, "take profit (intrabar)")
             else:
                 position.peak_price = max(position.peak_price, highs[i])
 

@@ -863,7 +863,11 @@ async function control(action) {
   const headers = { "x-btcagent-control": "1" };
   if (TOKEN) headers["x-dashboard-token"] = TOKEN;
   const response = await fetch(`/api/control/${action}`, { method: "POST", headers });
-  if (!response.ok) alert(`Control "${action}" failed: ${response.status}`);
+  if (!response.ok) {
+    let detail = String(response.status);
+    try { detail = (await response.json()).detail || detail; } catch { /* not JSON */ }
+    alert(`Control "${action}" failed: ${detail}`);
+  }
 }
 $("btn-pause").addEventListener("click", () => control(state && state.status === "paused" ? "resume" : "pause"));
 $("btn-reset").addEventListener("click", () => {

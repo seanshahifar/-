@@ -19,7 +19,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from btcagent.broker.base import Broker
+from btcagent.broker.base import Broker, OrderStatusUnknown
 from btcagent.config import Settings
 from btcagent.domain import Decision, Tick
 from btcagent.features import LIVE_LOOKBACK_BARS, WARMUP_BARS, compute_features, expected_abs_move
@@ -70,16 +70,24 @@ class TradingAgent:
         self.tf = settings.timeframe_seconds
         self.strategy = Strategy(settings.strategy, settings.trading)
 
+        self.events: deque[dict] = deque(maxlen=200)
         saved = None if fresh else journal.load_state(self._state_key)
+        self.paused = False
         if saved:
             self.ledger = Ledger.from_dict(saved["ledger"])
             self.risk = RiskManager(settings.risk, RiskState(**saved["risk"]))
+            self.paused = bool(saved.get("paused", False))
+            old_capital = self.ledger.capital
+            delta = self.ledger.rebase_capital(settings.trading.capital_usd)
+            if abs(delta) > 1e-9:  # trading.capital_usd changed since the last run: a deposit / withdrawal
+                self.risk.rebase(delta)
+                self.event("info", f"trading.capital_usd changed from ${old_capital:,.2f} to "
+                                   f"${self.ledger.capital:,.2f}; cash adjusted by ${delta:+,.2f}")
         else:
             self.ledger = Ledger(settings.trading.capital_usd)
             self.risk = RiskManager(settings.risk)
         self.resumed = bool(saved)
 
-        self.paused = False
         self.started_at = clock()
         self.tick: Tick | None = None
         self.bars = empty_bars()
@@ -91,7 +99,6 @@ class TradingAgent:
             journal.equity_history(self.mode, clock() - 86_400)[-2000:], maxlen=2000
         )
         self.trades: deque[TradeRecord] = deque(journal.recent_trades(self.mode, 100), maxlen=100)
-        self.events: deque[dict] = deque(maxlen=200)
         self._wake = asyncio.Event()
         self._lock = asyncio.Lock()
 
@@ -132,7 +139,9 @@ class TradingAgent:
         await self.broker.close()
 
     def persist(self) -> None:
-        self.journal.save_state(self._state_key, {"ledger": self.ledger.to_dict(), "risk": self.risk.state.to_dict()})
+        self.journal.save_state(self._state_key, {
+            "ledger": self.ledger.to_dict(), "risk": self.risk.state.to_dict(), "paused": self.paused,
+        })
 
     # ------------------------------------------------------------------ perception
     async def _tick_loop(self) -> None:
@@ -271,8 +280,16 @@ class TradingAgent:
         return await self._enter(now, tick, size, why)
 
     async def _enter(self, now: float, tick: Tick, usd: float, reason: str) -> Decision:
+        return await _finish_even_if_cancelled(self._place_buy(now, tick, usd, reason))
+
+    async def _exit(self, now: float, tick: Tick, reason: str) -> Decision:
+        return await _finish_even_if_cancelled(self._place_sell(now, tick, reason))
+
+    async def _place_buy(self, now: float, tick: Tick, usd: float, reason: str) -> Decision:
         try:
             fill = await self.broker.buy(usd, tick)
+        except OrderStatusUnknown as exc:
+            return self._order_status_unknown(now, "BUY", exc)
         except Exception as exc:
             self.event("error", f"BUY failed: {exc}")
             self.risk.state.last_trade_at = now  # cool down before retrying
@@ -282,26 +299,36 @@ class TradingAgent:
         self.event("trade", f"BUY {fill.qty:.6f} BTC @ {fill.price:,.2f} (${usd:,.2f}) — {reason}")
         return self._record_decision(now, "buy", reason)
 
-    async def _exit(self, now: float, tick: Tick, reason: str) -> Decision:
+    async def _place_sell(self, now: float, tick: Tick, reason: str) -> Decision:
         position = self.ledger.position
         if position is None:
             return self._hold(now, reason)
+        if not self.broker.is_sellable(position.qty, tick.price):
+            # Below the exchange's minimum order: it can never be sold, so stop tracking it.
+            loss = self.ledger.write_off_position()
+            self.persist()
+            self.event("warn", f"Wrote off {position.qty:.8f} BTC of dust (below the exchange's minimum order, "
+                               f"P&L ${loss:+,.2f}); it stays in your exchange account")
+            return self._hold(now, "position too small to sell (dust written off)")
         try:
             fill = await self.broker.sell(position.qty, tick)
+        except OrderStatusUnknown as exc:
+            return self._order_status_unknown(now, "SELL", exc)
         except Exception as exc:
-            if position.market_value(tick.price) < self.settings.risk.min_order_usd:
-                # Too small to sell on the exchange: stop tracking it rather than retrying forever.
-                self.ledger.position = None
-                self.persist()
-                self.event("warn", f"Left {position.qty:.8f} BTC of dust on the exchange (below the minimum "
-                                   f"order size); removed it from the agent's books")
-                return self._hold(now, "position too small to sell (dust)")
             self.event("error", f"SELL failed: {exc}")
             return self._hold(now, f"sell failed: {exc}")
-        record = self.ledger.apply_sell(fill, reason)
+        dust_left = not self.broker.is_sellable(position.qty - fill.qty, tick.price)
+        record = self.ledger.apply_sell(fill, reason, close_remainder=dust_left)
         self._book(now, record, fill.order_id)
         self.event("trade", f"SELL {fill.qty:.6f} BTC @ {fill.price:,.2f}, P&L ${record.pnl_usd:+,.2f} — {reason}")
         return self._record_decision(now, "sell", reason)
+
+    def _order_status_unknown(self, now: float, side: str, exc: Exception) -> Decision:
+        reason = f"{side} order outcome unknown ({exc}). Check your exchange account, then press Reset"
+        self.risk.kill(reason)
+        self.persist()
+        self.event("error", reason)
+        return self._hold(now, reason)
 
     def _book(self, now: float, record: TradeRecord, order_id: str) -> None:
         self.risk.record_trade(now)
@@ -320,10 +347,12 @@ class TradingAgent:
     # ------------------------------------------------------------------ controls
     def pause(self) -> None:
         self.paused = True
+        self.persist()
         self.event("control", "Paused: no new positions will be opened (exits still active)")
 
     def resume(self) -> None:
         self.paused = False
+        self.persist()
         self.event("control", "Resumed")
 
     async def kill(self) -> None:
@@ -335,8 +364,9 @@ class TradingAgent:
             self.persist()
 
     def reset(self) -> None:
-        price = self.tick.price if self.tick else 0.0
-        self.risk.reset(self.ledger.equity(price), self.clock())
+        if self.tick is None:  # the new loss baselines need a real valuation of any open position
+            raise ValueError("No price yet: wait for the first price before resetting the limits")
+        self.risk.reset(self.ledger.equity(self.tick.price), self.clock())
         self.event("control", "Risk limits reset; trading allowed again")
         self.persist()
 
@@ -377,10 +407,16 @@ class TradingAgent:
             current_auc = self.model.metrics.get("auc", 0.5) if self.model else 0.5
             new_auc = candidate.metrics["auc"]
             if new_auc >= max(0.5, current_auc - 0.005) and candidate.metrics["calibration_slope"] > 0:
-                self.model = candidate
-                if not self.feed.simulated:
-                    candidate.save(self.settings.model.path)
-                self._update_prediction()
+                previous = self.model
+                try:
+                    if not self.feed.simulated:
+                        candidate.save(self.settings.model.path)
+                    self.model = candidate
+                    self._update_prediction()
+                except Exception as exc:  # never let a retrain take the agent (and its stops) down
+                    self.model = previous
+                    self.event("error", f"Could not swap in the retrained model ({exc}); keeping the current one")
+                    continue
                 self.event("info", f"Model retrained and swapped in (AUC {current_auc:.4f} -> {new_auc:.4f})")
             else:
                 self.event("info", f"Retrained model rejected (AUC {new_auc:.4f} vs current {current_auc:.4f})")
@@ -473,6 +509,17 @@ class TradingAgent:
             "news": self.news.snapshot(25) if self.news is not None else None,
             "events": list(self.events)[-40:][::-1],
         })
+
+
+async def _finish_even_if_cancelled(coro):
+    """Run an order and its booking to completion even if the agent is shutting down meanwhile,
+    so an order the exchange accepted is never left out of the books."""
+    task = asyncio.ensure_future(coro)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
 
 
 def json_safe(value):

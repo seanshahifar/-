@@ -8,7 +8,11 @@ from btcagent.domain import Fill, Tick
 
 
 class OrderError(RuntimeError):
-    """An order could not be placed or did not fill; the ledger is left unchanged."""
+    """An order was rejected or did not fill; nothing changed on the exchange."""
+
+
+class OrderStatusUnknown(RuntimeError):
+    """An order may have executed but its outcome couldn't be determined. Trading must halt."""
 
 
 class Broker(ABC):
@@ -25,6 +29,10 @@ class Broker(ABC):
     @abstractmethod
     async def sell(self, qty: float, tick: Tick) -> Fill:
         """Sell ``qty`` BTC at market."""
+
+    def is_sellable(self, qty: float, price: float) -> bool:
+        """Whether the exchange would accept a sell of ``qty`` (False for dust below its minimums)."""
+        return qty > 1e-12
 
     async def close(self) -> None:
         return None

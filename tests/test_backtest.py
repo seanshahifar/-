@@ -59,6 +59,18 @@ def test_stops_fill_at_the_gap_open_not_the_stop_price():
     bars, gap_open = gap_down_bars()
     settings = make_settings(*PERMISSIVE, "risk.stop_loss_pct=0.01", "risk.take_profit_pct=0", "risk.max_hold_minutes=0")
     result = run_backtest(bars, FakeModel(p_up=0.9, horizon_bars=1), settings, start=bars.index[290])
-    stop = next(t for t in result.trades if t.reason == "stop (intrabar)")
+    stop = next(t for t in result.trades if t.reason == "stop (gap)")
     assert stop.price < gap_open  # filled at the open (minus spread/slippage), well below the stop level
     assert stop.pnl_usd < 0
+
+
+def test_a_gap_above_the_target_takes_profit_at_the_open():
+    bars, gap_open = gap_down_bars()
+    up = bars.copy()
+    last = up.index[-1]
+    up.loc[last, ["open", "high", "close"]] = gap_open / 0.95 * 1.05  # opens 5% higher instead
+    up.loc[last, "low"] = up.loc[last, "open"] * 0.97  # then dips through the stop within the bar
+    settings = make_settings(*PERMISSIVE, "risk.stop_loss_pct=0.01", "risk.take_profit_pct=0.02",
+                             "risk.max_hold_minutes=0")
+    result = run_backtest(up, FakeModel(p_up=0.9, horizon_bars=1), settings, start=up.index[290])
+    assert any(t.reason == "take profit (gap)" and t.pnl_usd > 0 for t in result.trades)
